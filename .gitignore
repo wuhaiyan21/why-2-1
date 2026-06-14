@@ -1,0 +1,24 @@
+# OS
+.DS_Store
+Thumbs.db
+.env
+.env.*
+!.env.example
+*.log
+logs/
+node_modules/
+dist/
+build/
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+*.egg-info/
+.idea/
+.vscode/
+.docker/
+coverage/
+htmlcov/
+.coverage
+*.csv
+models/
