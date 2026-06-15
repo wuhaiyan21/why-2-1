@@ -157,6 +157,7 @@ if sales_file is not None and sales_df is not None:
         prod_info = summary['product_model_info'][summary['product_model_info']['product_code'] == selected_product]
         history_days = prod_info['history_days'].values[0] if len(prod_info) > 0 else 0
         record_count = prod_info['record_count'].values[0] if len(prod_info) > 0 else 0
+        data_coverage = prod_info['data_coverage'].values[0] if len(prod_info) > 0 else 0
 
         col_info1, col_info2 = st.columns(2)
         col_info1.info(f"**商品编码**：{selected_product}")
@@ -169,9 +170,14 @@ if sales_file is not None and sales_df is not None:
         else:
             col_info4.success(f"**低可信天数**：{low_conf_days} / {FORECAST_DAYS} 天")
 
-        col_info5, col_info6 = st.columns(2)
+        col_info5, col_info6, col_info7 = st.columns(3)
         col_info5.info(f"**历史日历跨度**：{history_days} 天")
         col_info6.info(f"**历史记录数**：{record_count} 条")
+        coverage_pct = f"{data_coverage:.0%}"
+        if data_coverage >= 0.6:
+            col_info7.success(f"**数据覆盖度**：{coverage_pct}")
+        else:
+            col_info7.warning(f"**数据覆盖度**：{coverage_pct}")
 
         st.markdown("### 📉 预测趋势图")
 

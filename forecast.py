@@ -9,6 +9,7 @@ warnings.filterwarnings('ignore')
 SEASONAL_MONTHS = [11, 12]
 SEASONAL_WEIGHT = 1.3
 MIN_HISTORY_DAYS = 30
+MIN_DATA_COVERAGE = 0.6
 FORECAST_DAYS = 30
 
 
@@ -86,8 +87,11 @@ def train_single_product(product_df):
 
     date_span_days = (product_df['date'].max() - product_df['date'].min()).days + 1
     record_count = len(product_df)
+    data_coverage = record_count / date_span_days if date_span_days > 0 else 0
 
-    if date_span_days < MIN_HISTORY_DAYS or record_count < MIN_HISTORY_DAYS:
+    if (date_span_days < MIN_HISTORY_DAYS
+            or record_count < MIN_HISTORY_DAYS
+            or data_coverage < MIN_DATA_COVERAGE):
         return None
 
     product_df = add_date_features(product_df)
@@ -114,6 +118,7 @@ def train_single_product(product_df):
         'avg_sales': avg_sales,
         'history_days': date_span_days,
         'record_count': record_count,
+        'data_coverage': data_coverage,
         'min_date': product_df['date'].min(),
         'max_date': product_df['date'].max(),
         'min_date_global': product_df['date'].min()
@@ -194,7 +199,7 @@ def compute_category_avg(sales_df, product_master, valid_products=None):
     return category_stats
 
 
-def forecast_by_category(category_stats, category_name, forecast_start_date):
+def forecast_by_category(category_stats, category_name, forecast_start_date, ci_multiplier=1.0):
     cat_row = category_stats[category_stats['category'] == category_name]
 
     if len(cat_row) == 0:
@@ -206,6 +211,8 @@ def forecast_by_category(category_stats, category_name, forecast_start_date):
 
     if std_val <= 0:
         std_val = avg_val * 0.3 if avg_val > 0 else 1.0
+
+    std_val = std_val * ci_multiplier
 
     forecast_dates = pd.date_range(start=forecast_start_date, periods=FORECAST_DAYS, freq='D')
     forecast_df = pd.DataFrame({'date': forecast_dates})
@@ -264,39 +271,48 @@ def run_forecast(sales_df, product_master_df, has_master_data=False):
 
     product_model_map = {}
     individual_products = []
-    category_products_no_master = []
+    category_products = []
 
     for product in products:
         product_data = sales_df[sales_df['product_code'] == product]
 
         date_span_days = (product_data['date'].max() - product_data['date'].min()).days + 1
         record_count = len(product_data)
+        data_coverage = record_count / date_span_days if date_span_days > 0 else 0
 
-        if date_span_days >= MIN_HISTORY_DAYS and record_count >= MIN_HISTORY_DAYS:
+        is_individual = (
+            date_span_days >= MIN_HISTORY_DAYS
+            and record_count >= MIN_HISTORY_DAYS
+            and data_coverage >= MIN_DATA_COVERAGE
+        )
+
+        if is_individual:
             model_info = train_single_product(product_data)
             if model_info is not None:
                 product_model_map[product] = {
                     'type': 'individual',
                     'model_info': model_info,
                     'history_days': date_span_days,
-                    'record_count': record_count
+                    'record_count': record_count,
+                    'data_coverage': data_coverage
                 }
                 individual_products.append(product)
             else:
                 product_model_map[product] = {
                     'type': 'category',
                     'history_days': date_span_days,
-                    'record_count': record_count
+                    'record_count': record_count,
+                    'data_coverage': data_coverage
                 }
+                category_products.append(product)
         else:
             product_model_map[product] = {
                 'type': 'category',
                 'history_days': date_span_days,
-                'record_count': record_count
+                'record_count': record_count,
+                'data_coverage': data_coverage
             }
-
-        if product_model_map[product]['type'] == 'category' and not has_master_data:
-            category_products_no_master.append(product)
+            category_products.append(product)
 
     category_stats = compute_category_avg(sales_df, product_master_df, valid_products=individual_products)
 
@@ -309,15 +325,31 @@ def run_forecast(sales_df, product_master_df, has_master_data=False):
         if info['type'] == 'individual':
             forecast_df = forecast_single_product(info['model_info'], forecast_start)
         else:
+            cat_row = product_master_df[product_master_df['product_code'] == product]
+            category = cat_row['category'].values[0] if len(cat_row) > 0 else '未分类'
+
+            record_count = info['record_count']
+            if record_count < MIN_HISTORY_DAYS:
+                ci_multiplier = max(2.0, MIN_HISTORY_DAYS / max(record_count, 1))
+            else:
+                ci_multiplier = max(1.5, MIN_DATA_COVERAGE / max(info['data_coverage'], 0.01))
+
             if not has_master_data:
                 warnings.append(
-                    f"商品 {product} 历史不足{MIN_HISTORY_DAYS}天，但未上传商品主数据，无法用品类均值回退。"
+                    f"商品 {product} 历史数据不足（记录{record_count}条/覆盖度{info['data_coverage']:.0%}），"
+                    f"且未上传商品主数据，无法使用真实品类均值回退。"
                     f"建议上传商品主数据CSV以获得更准确的预测。"
                 )
 
-            cat_row = product_master_df[product_master_df['product_code'] == product]
-            category = cat_row['category'].values[0] if len(cat_row) > 0 else '未分类'
-            forecast_df = forecast_by_category(category_stats, category, forecast_start)
+            forecast_df = forecast_by_category(
+                category_stats, category, forecast_start,
+                ci_multiplier=ci_multiplier
+            )
+
+            if not has_master_data:
+                forecast_df['model_type'] = '默认回退'
+            else:
+                forecast_df['model_type'] = '品类平均'
 
         forecast_df['product_code'] = product
 
@@ -338,8 +370,9 @@ def run_forecast(sales_df, product_master_df, has_master_data=False):
     result_df = result_df.sort_values(['product_code', 'date']).reset_index(drop=True)
 
     summary = generate_summary(result_df, product_model_map, category_stats, sales_df=sales_df)
-    summary['warnings'] = warnings
+    summary['warnings'] = list(set(warnings))
     summary['has_master_data'] = has_master_data
+    summary['individual_products'] = individual_products
 
     return result_df, summary
 
@@ -359,32 +392,42 @@ def generate_summary(forecast_df, product_model_map, category_stats, sales_df=No
     category_summary['forecast_daily_avg'] = category_summary['total_forecast'] / FORECAST_DAYS
 
     if sales_df is not None:
-        sales_with_cat = sales_df.merge(
+        individual_products = [p for p, info in product_model_map.items() if info['type'] == 'individual']
+
+        if len(individual_products) > 0:
+            sales_individual = sales_df[sales_df['product_code'].isin(individual_products)]
+        else:
+            sales_individual = sales_df.iloc[0:0]
+
+        sales_with_cat = sales_individual.merge(
             forecast_df[['product_code', 'category']].drop_duplicates(),
             on='product_code',
             how='left'
         )
         historical_stats = sales_with_cat.groupby('category').agg(
             historical_total=('sales', 'sum'),
-            historical_days=('date', 'nunique')
+            historical_days=('date', 'nunique'),
+            historical_product_count=('product_code', 'nunique')
         ).reset_index()
         historical_stats['historical_daily_avg'] = np.where(
-            historical_stats['historical_days'] > 0,
-            historical_stats['historical_total'] / historical_stats['historical_days'],
+            (historical_stats['historical_days'] > 0) & (historical_stats['historical_product_count'] > 0),
+            historical_stats['historical_total'] / historical_stats['historical_days'] / historical_stats['historical_product_count'],
             0
         )
         category_summary = category_summary.merge(
-            historical_stats[['category', 'historical_daily_avg', 'historical_total', 'historical_days']],
+            historical_stats[['category', 'historical_daily_avg', 'historical_total', 'historical_days', 'historical_product_count']],
             on='category',
             how='left'
         )
         category_summary['historical_daily_avg'] = category_summary['historical_daily_avg'].fillna(0)
         category_summary['historical_total'] = category_summary['historical_total'].fillna(0)
         category_summary['historical_days'] = category_summary['historical_days'].fillna(0)
+        category_summary['historical_product_count'] = category_summary['historical_product_count'].fillna(0)
     else:
         category_summary['historical_daily_avg'] = 0
         category_summary['historical_total'] = 0
         category_summary['historical_days'] = 0
+        category_summary['historical_product_count'] = 0
 
     individual_count = sum(1 for v in product_model_map.values() if v['type'] == 'individual')
     category_count = sum(1 for v in product_model_map.values() if v['type'] == 'category')
@@ -401,7 +444,8 @@ def generate_summary(forecast_df, product_model_map, category_stats, sales_df=No
         product_details.append({
             'product_code': product,
             'history_days': info.get('history_days', 0),
-            'record_count': info.get('record_count', 0)
+            'record_count': info.get('record_count', 0),
+            'data_coverage': info.get('data_coverage', 0)
         })
     product_details_df = pd.DataFrame(product_details)
     product_model_info = product_model_info.merge(product_details_df, on='product_code', how='left')
