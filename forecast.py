@@ -125,7 +125,12 @@ def train_single_product(product_df):
     }
 
 
-def forecast_single_product(model_info, forecast_start_date):
+def forecast_single_product(model_info, forecast_start_date, seasonal_months=None, seasonal_weight=None):
+    if seasonal_months is None:
+        seasonal_months = SEASONAL_MONTHS
+    if seasonal_weight is None:
+        seasonal_weight = SEASONAL_WEIGHT
+
     model = model_info['model']
     feature_cols = model_info['feature_cols']
     residual_std = model_info['residual_std']
@@ -140,8 +145,8 @@ def forecast_single_product(model_info, forecast_start_date):
     X_forecast = forecast_df[feature_cols].values
     y_pred = model.predict(X_forecast)
 
-    seasonal_mask = forecast_df['month'].isin(SEASONAL_MONTHS)
-    y_pred[seasonal_mask] = y_pred[seasonal_mask] * SEASONAL_WEIGHT
+    seasonal_mask = forecast_df['month'].isin(seasonal_months)
+    y_pred[seasonal_mask] = y_pred[seasonal_mask] * seasonal_weight
 
     y_pred = np.maximum(y_pred, 0)
 
@@ -199,7 +204,12 @@ def compute_category_avg(sales_df, product_master, valid_products=None):
     return category_stats
 
 
-def forecast_by_category(category_stats, category_name, forecast_start_date, ci_multiplier=1.0):
+def forecast_by_category(category_stats, category_name, forecast_start_date, ci_multiplier=1.0, seasonal_months=None, seasonal_weight=None):
+    if seasonal_months is None:
+        seasonal_months = SEASONAL_MONTHS
+    if seasonal_weight is None:
+        seasonal_weight = SEASONAL_WEIGHT
+
     cat_row = category_stats[category_stats['category'] == category_name]
 
     if len(cat_row) == 0:
@@ -218,9 +228,9 @@ def forecast_by_category(category_stats, category_name, forecast_start_date, ci_
     forecast_df = pd.DataFrame({'date': forecast_dates})
     forecast_df['month'] = forecast_df['date'].dt.month
 
-    seasonal_mask = forecast_df['month'].isin(SEASONAL_MONTHS)
+    seasonal_mask = forecast_df['month'].isin(seasonal_months)
     forecast = np.full(FORECAST_DAYS, avg_val, dtype=float)
-    forecast[seasonal_mask] = forecast[seasonal_mask] * SEASONAL_WEIGHT
+    forecast[seasonal_mask] = forecast[seasonal_mask] * seasonal_weight
 
     half_ci = 1.96 * std_val
     ci_lower = forecast - half_ci
@@ -240,7 +250,12 @@ def forecast_by_category(category_stats, category_name, forecast_start_date, ci_
     return forecast_df
 
 
-def run_forecast(sales_df, product_master_df, has_master_data=False):
+def run_forecast(sales_df, product_master_df, has_master_data=False, seasonal_months=None, seasonal_weight=None):
+    if seasonal_months is None:
+        seasonal_months = SEASONAL_MONTHS
+    if seasonal_weight is None:
+        seasonal_weight = SEASONAL_WEIGHT
+
     sales_df = sales_df.copy()
     sales_df['product_code'] = sales_df['product_code'].astype(str)
 
@@ -323,7 +338,11 @@ def run_forecast(sales_df, product_master_df, has_master_data=False):
         info = product_model_map[product]
 
         if info['type'] == 'individual':
-            forecast_df = forecast_single_product(info['model_info'], forecast_start)
+            forecast_df = forecast_single_product(
+                info['model_info'], forecast_start,
+                seasonal_months=seasonal_months,
+                seasonal_weight=seasonal_weight
+            )
         else:
             cat_row = product_master_df[product_master_df['product_code'] == product]
             category = cat_row['category'].values[0] if len(cat_row) > 0 else '未分类'
@@ -343,7 +362,9 @@ def run_forecast(sales_df, product_master_df, has_master_data=False):
 
             forecast_df = forecast_by_category(
                 category_stats, category, forecast_start,
-                ci_multiplier=ci_multiplier
+                ci_multiplier=ci_multiplier,
+                seasonal_months=seasonal_months,
+                seasonal_weight=seasonal_weight
             )
 
             if not has_master_data:
@@ -373,6 +394,7 @@ def run_forecast(sales_df, product_master_df, has_master_data=False):
     summary['warnings'] = list(set(warnings))
     summary['has_master_data'] = has_master_data
     summary['individual_products'] = individual_products
+    summary['product_model_map'] = product_model_map
 
     return result_df, summary
 
@@ -462,3 +484,82 @@ def generate_summary(forecast_df, product_model_map, category_stats, sales_df=No
         'low_confidence_details': low_conf_details,
         'category_stats': category_stats
     }
+
+
+def run_backtest(sales_df, product_code, backtest_start, backtest_end, seasonal_months=None, seasonal_weight=None):
+    if seasonal_months is None:
+        seasonal_months = SEASONAL_MONTHS
+    if seasonal_weight is None:
+        seasonal_weight = SEASONAL_WEIGHT
+
+    product_data = sales_df[sales_df['product_code'] == product_code].copy()
+    product_data = product_data.sort_values('date').reset_index(drop=True)
+
+    if len(product_data) == 0:
+        return None, "无销售数据"
+
+    backtest_start = pd.to_datetime(backtest_start)
+    backtest_end = pd.to_datetime(backtest_end)
+
+    train_data = product_data[product_data['date'] < backtest_start]
+
+    date_span_days = (train_data['date'].max() - train_data['date'].min()).days + 1 if len(train_data) > 0 else 0
+    record_count = len(train_data)
+    data_coverage = record_count / date_span_days if date_span_days > 0 else 0
+
+    if (date_span_days < MIN_HISTORY_DAYS
+            or record_count < MIN_HISTORY_DAYS
+            or data_coverage < MIN_DATA_COVERAGE):
+        return None, f"训练数据不足（{record_count}条记录，覆盖度{data_coverage:.0%}），至少需要{MIN_HISTORY_DAYS}天有效数据"
+
+    model_info = train_single_product(train_data)
+    if model_info is None:
+        return None, "模型训练失败"
+
+    backtest_dates = pd.date_range(start=backtest_start, end=backtest_end, freq='D')
+    backtest_df = pd.DataFrame({'date': backtest_dates})
+
+    actual_data = product_data[product_data['date'].between(backtest_start, backtest_end)][['date', 'sales']]
+    backtest_df = backtest_df.merge(actual_data, on='date', how='left')
+    backtest_df['sales'] = backtest_df['sales'].fillna(0)
+
+    backtest_df_features = backtest_df.copy()
+    backtest_df_features = add_date_features(backtest_df_features)
+    backtest_df_features['time_index'] = (backtest_df_features['date'] - model_info['min_date_global']).dt.days
+
+    X_backtest = backtest_df_features[model_info['feature_cols']].values
+    y_pred = model_info['model'].predict(X_backtest)
+
+    seasonal_mask = backtest_df_features['month'].isin(seasonal_months)
+    y_pred[seasonal_mask] = y_pred[seasonal_mask] * seasonal_weight
+    y_pred = np.maximum(y_pred, 0)
+
+    backtest_df['forecast'] = y_pred
+    backtest_df['abs_error'] = np.abs(backtest_df['forecast'] - backtest_df['sales'])
+
+    backtest_df['error_rate'] = np.where(
+        backtest_df['sales'] > 0,
+        backtest_df['abs_error'] / backtest_df['sales'],
+        np.nan
+    )
+    backtest_df['is_actual_zero'] = backtest_df['sales'] == 0
+
+    valid_error_rates = backtest_df[~backtest_df['is_actual_zero']]['error_rate']
+    mae = backtest_df['abs_error'].mean()
+    max_deviation = backtest_df['abs_error'].max()
+    avg_error_rate = valid_error_rates.mean() if len(valid_error_rates) > 0 else np.nan
+
+    backtest_df['product_code'] = product_code
+
+    stats = {
+        'backtest_days': len(backtest_df),
+        'non_zero_days': len(valid_error_rates),
+        'zero_days': backtest_df['is_actual_zero'].sum(),
+        'mae': mae,
+        'max_deviation': max_deviation,
+        'avg_error_rate': avg_error_rate,
+        'total_actual': backtest_df['sales'].sum(),
+        'total_forecast': backtest_df['forecast'].sum()
+    }
+
+    return backtest_df, stats

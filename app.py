@@ -8,8 +8,10 @@ from forecast import (
     load_sales_data,
     load_product_master,
     run_forecast,
+    run_backtest,
     FORECAST_DAYS,
     MIN_HISTORY_DAYS,
+    MIN_DATA_COVERAGE,
     SEASONAL_MONTHS,
     SEASONAL_WEIGHT
 )
@@ -43,7 +45,19 @@ with st.sidebar:
     st.markdown("---")
 
     st.subheader("⚙️ 预测参数")
-    st.info(f"预测天数：{FORECAST_DAYS} 天\n最少历史天数：{MIN_HISTORY_DAYS} 天\n\n季节性月份：{', '.join(str(m) + '月' for m in SEASONAL_MONTHS)}\n季节加权：{SEASONAL_WEIGHT}x")
+    st.info(f"预测天数：{FORECAST_DAYS} 天\n最少历史天数：{MIN_HISTORY_DAYS} 天")
+
+    st.markdown("**季节性加权设置**")
+    seasonal_weight = st.number_input(
+        "十一月/十二月加权倍数",
+        min_value=0.1,
+        max_value=5.0,
+        value=float(SEASONAL_WEIGHT),
+        step=0.1,
+        key="seasonal_weight_input",
+        help="设置十一月和十二月的销量加权系数，默认1.3倍"
+    )
+    st.caption(f"季节性月份：{', '.join(str(m) + '月' for m in SEASONAL_MONTHS)}")
 
     st.markdown("---")
 
@@ -123,11 +137,16 @@ if master_file is not None:
 if sales_file is not None and sales_df is not None:
     st.markdown("---")
 
-    tab1, tab2, tab3, tab4 = st.tabs(["📈 预测结果", "📊 品类汇总", "⚠️ 低可信预警", "📋 数据预览"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["📈 预测结果", "📊 品类汇总", "🔍 模型回测", "⚠️ 低可信预警", "📋 数据预览"])
 
     with st.spinner("正在进行预测分析..."):
         has_master = master_df is not None and len(master_df) > 0
-        forecast_df, summary = run_forecast(sales_df, master_df, has_master_data=has_master)
+        forecast_df, summary = run_forecast(
+            sales_df, master_df,
+            has_master_data=has_master,
+            seasonal_months=SEASONAL_MONTHS,
+            seasonal_weight=seasonal_weight
+        )
 
     if 'warnings' in summary and len(summary['warnings']) > 0:
         for warning in list(set(summary['warnings'])):
@@ -336,6 +355,185 @@ if sales_file is not None and sales_df is not None:
         )
 
     with tab3:
+        st.markdown("### 🔍 模型回测")
+        st.info("选择商品和历史回测窗口，用窗口前的数据训练模型，对窗口内每天做预测，评估模型拟合效果。回测仅支持独立建模商品。")
+
+        product_model_info = summary['product_model_info']
+        individual_products = summary['individual_products']
+        product_model_map = summary.get('product_model_map', {})
+
+        all_products_sorted = sorted(product_model_info['product_code'].unique())
+
+        product_options = []
+        product_disabled_reason = {}
+        for prod in all_products_sorted:
+            info = product_model_info[product_model_info['product_code'] == prod].iloc[0]
+            model_type = info['model_type']
+            record_count = info.get('record_count', 0)
+            data_coverage = info.get('data_coverage', 0)
+            cat = info['category']
+
+            if model_type == '独立建模':
+                product_options.append(prod)
+            else:
+                reason = ''
+                if model_type in ['品类平均', '默认回退']:
+                    reason = f"数据不足（记录{record_count:.0f}条/覆盖度{data_coverage:.0%}），使用品类回退"
+                product_disabled_reason[prod] = reason
+
+        st.markdown("#### 📦 商品选择")
+
+        selected_backtest_product = st.selectbox(
+            "选择回测商品",
+            product_options,
+            index=0 if len(product_options) > 0 else None,
+            key="backtest_product_select",
+            disabled=len(product_options) == 0
+        )
+
+        if len(product_disabled_reason) > 0:
+            with st.expander(f"⚠️ 不可回测商品（{len(product_disabled_reason)} 个）"):
+                for prod, reason in product_disabled_reason.items():
+                    st.markdown(f"- **{prod}**：{reason}")
+
+        min_date = sales_df['date'].min()
+        max_date = sales_df['date'].max()
+
+        st.markdown("#### 📅 回测窗口选择")
+
+        default_backtest_days = 30
+        default_end = max_date - pd.Timedelta(days=1)
+        default_start = default_end - pd.Timedelta(days=default_backtest_days - 1)
+
+        if default_start < min_date + pd.Timedelta(days=MIN_HISTORY_DAYS):
+            default_start = min_date + pd.Timedelta(days=MIN_HISTORY_DAYS)
+
+        col_date1, col_date2 = st.columns(2)
+        with col_date1:
+            backtest_start_date = st.date_input(
+                "回测开始日期",
+                value=default_start.date() if hasattr(default_start, 'date') else default_start,
+                min_value=min_date.date() if hasattr(min_date, 'date') else min_date,
+                max_value=max_date.date() if hasattr(max_date, 'date') else max_date,
+                key="backtest_start"
+            )
+        with col_date2:
+            backtest_end_date = st.date_input(
+                "回测结束日期",
+                value=default_end.date() if hasattr(default_end, 'date') else default_end,
+                min_value=min_date.date() if hasattr(min_date, 'date') else min_date,
+                max_value=max_date.date() if hasattr(max_date, 'date') else max_date,
+                key="backtest_end"
+            )
+
+        backtest_result_df = None
+        backtest_stats = None
+        backtest_error_msg = None
+
+        if selected_backtest_product:
+            with st.spinner("正在执行回测..."):
+                backtest_result_df, backtest_stats = run_backtest(
+                    sales_df,
+                    selected_backtest_product,
+                    backtest_start_date,
+                    backtest_end_date,
+                    seasonal_months=SEASONAL_MONTHS,
+                    seasonal_weight=seasonal_weight
+                )
+                if backtest_result_df is None:
+                    backtest_error_msg = backtest_stats
+
+        if backtest_error_msg:
+            st.error(f"回测失败：{backtest_error_msg}")
+        elif backtest_result_df is not None and backtest_stats is not None:
+
+            st.markdown("---")
+            st.markdown("### 📊 回测统计指标")
+
+            col_stat1, col_stat2, col_stat3, col_stat4 = st.columns(4)
+            col_stat1.metric("回测天数", f"{backtest_stats['backtest_days']} 天")
+            col_stat2.metric("平均绝对误差 (MAE)", f"{backtest_stats['mae']:.2f}")
+            col_stat3.metric("最大单日偏差", f"{backtest_stats['max_deviation']:.2f}")
+            avg_err_rate_str = f"{backtest_stats['avg_error_rate']:.2%}" if not np.isnan(backtest_stats['avg_error_rate']) else "N/A"
+            col_stat4.metric("平均误差率", avg_err_rate_str, help="实际销量为零的日期不参与计算")
+
+            col_stat5, col_stat6 = st.columns(2)
+            col_stat5.metric("实际总销量", f"{backtest_stats['total_actual']:.0f}")
+            col_stat6.metric("预测总销量", f"{backtest_stats['total_forecast']:.0f}")
+
+            st.markdown("### 📉 实际销量 vs 预测销量")
+
+            plot_backtest = backtest_result_df.copy()
+            plot_backtest['日期'] = plot_backtest['date']
+            plot_backtest['实际销量'] = plot_backtest['sales']
+            plot_backtest['预测销量'] = plot_backtest['forecast']
+
+            fig_bt = px.line(
+                plot_backtest,
+                x='日期',
+                y=['实际销量', '预测销量'],
+                title=f'商品 {selected_backtest_product} - 回测期实际销量 vs 预测销量对比',
+                labels={'value': '销量', '日期': '日期', 'variable': '类型'},
+                color_discrete_map={'实际销量': '#2ecc71', '预测销量': '#3498db'}
+            )
+            fig_bt.update_layout(
+                hovermode='x unified',
+                showlegend=True,
+                height=400,
+                legend_title='数据类型'
+            )
+            st.plotly_chart(fig_bt, use_container_width=True)
+
+            st.markdown("### 📋 回测明细")
+
+            display_bt = backtest_result_df.copy()
+            display_bt['日期'] = display_bt['date'].dt.strftime('%Y-%m-%d')
+            display_bt['实际销量'] = display_bt['sales'].round(2)
+            display_bt['预测销量'] = display_bt['forecast'].round(2)
+            display_bt['绝对误差'] = display_bt['abs_error'].round(2)
+            display_bt['误差率'] = display_bt.apply(
+                lambda x: '— (实际为零)' if x['is_actual_zero'] else f"{x['error_rate']:.2%}",
+                axis=1
+            )
+
+            st.dataframe(
+                display_bt[['日期', '实际销量', '预测销量', '绝对误差', '误差率']],
+                use_container_width=True,
+                hide_index=True
+            )
+
+            export_bt_df = backtest_result_df.copy()
+            export_bt_df = export_bt_df.rename(columns={
+                'sales': 'actual_sales',
+                'abs_error': 'absolute_error'
+            })
+
+            prod_info_row = product_model_info[product_model_info['product_code'] == selected_backtest_product]
+            if len(prod_info_row) > 0:
+                export_bt_df['category'] = prod_info_row['category'].values[0]
+                export_bt_df['model_type'] = prod_info_row['model_type'].values[0]
+            else:
+                export_bt_df['category'] = '未知'
+                export_bt_df['model_type'] = '独立建模'
+
+            export_bt_df = export_bt_df[[
+                'product_code', 'category', 'date', 'actual_sales', 'forecast',
+                'absolute_error', 'error_rate', 'is_actual_zero', 'model_type'
+            ]]
+            export_bt_df['date'] = export_bt_df['date'].dt.strftime('%Y-%m-%d')
+
+            csv_buffer_bt = io.StringIO()
+            export_bt_df.to_csv(csv_buffer_bt, index=False, encoding='utf-8-sig')
+
+            st.download_button(
+                label="📥 导出回测结果 (CSV)",
+                data=csv_buffer_bt.getvalue(),
+                file_name=f"backtest_{selected_backtest_product}.csv",
+                mime="text/csv",
+                type="primary"
+            )
+
+    with tab4:
         st.markdown("### ⚠️ 低可信预测汇总")
         st.info("置信区间宽度超过预测值50%的日期标记为低可信。")
 
@@ -376,7 +574,7 @@ if sales_file is not None and sales_df is not None:
         else:
             st.success("🎉 所有商品的预测置信度均符合要求！")
 
-    with tab4:
+    with tab5:
         st.markdown("### 📋 销售数据预览")
 
         st.info(f"数据时间范围：{sales_df['date'].min().strftime('%Y-%m-%d')} ~ {sales_df['date'].max().strftime('%Y-%m-%d')}")
