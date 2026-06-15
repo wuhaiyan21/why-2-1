@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import plotly.express as px
 import io
 
@@ -125,7 +126,12 @@ if sales_file is not None and sales_df is not None:
     tab1, tab2, tab3, tab4 = st.tabs(["📈 预测结果", "📊 品类汇总", "⚠️ 低可信预警", "📋 数据预览"])
 
     with st.spinner("正在进行预测分析..."):
-        forecast_df, summary = run_forecast(sales_df, master_df)
+        has_master = master_df is not None and len(master_df) > 0
+        forecast_df, summary = run_forecast(sales_df, master_df, has_master_data=has_master)
+
+    if 'warnings' in summary and len(summary['warnings']) > 0:
+        for warning in list(set(summary['warnings'])):
+            st.warning(warning)
 
     with tab1:
         col1, col2, col3, col4 = st.columns(4)
@@ -148,6 +154,10 @@ if sales_file is not None and sales_df is not None:
         model_type = product_forecast['model_type'].iloc[0]
         category = product_forecast['category'].iloc[0]
 
+        prod_info = summary['product_model_info'][summary['product_model_info']['product_code'] == selected_product]
+        history_days = prod_info['history_days'].values[0] if len(prod_info) > 0 else 0
+        record_count = prod_info['record_count'].values[0] if len(prod_info) > 0 else 0
+
         col_info1, col_info2 = st.columns(2)
         col_info1.info(f"**商品编码**：{selected_product}")
         col_info2.info(f"**品类**：{category}")
@@ -158,6 +168,10 @@ if sales_file is not None and sales_df is not None:
             col_info4.warning(f"**低可信天数**：{low_conf_days} / {FORECAST_DAYS} 天")
         else:
             col_info4.success(f"**低可信天数**：{low_conf_days} / {FORECAST_DAYS} 天")
+
+        col_info5, col_info6 = st.columns(2)
+        col_info5.info(f"**历史日历跨度**：{history_days} 天")
+        col_info6.info(f"**历史记录数**：{record_count} 条")
 
         st.markdown("### 📉 预测趋势图")
 
@@ -233,18 +247,18 @@ if sales_file is not None and sales_df is not None:
         st.markdown("### 📊 品类汇总对比")
 
         cat_summary = summary['category_summary'].copy()
-        cat_summary.columns = ['品类', '商品数量', '预测总销量', '低可信天数']
 
         col_chart1, col_chart2 = st.columns(2)
 
         with col_chart1:
             fig_bar = px.bar(
                 cat_summary,
-                x='品类',
-                y='预测总销量',
+                x='category',
+                y='total_forecast',
                 title='各品类预测总销量',
-                color='品类',
-                text_auto='.0f'
+                color='category',
+                text_auto='.0f',
+                labels={'category': '品类', 'total_forecast': '预测总销量'}
             )
             fig_bar.update_layout(height=400, showlegend=False)
             st.plotly_chart(fig_bar, use_container_width=True)
@@ -252,19 +266,65 @@ if sales_file is not None and sales_df is not None:
         with col_chart2:
             fig_count = px.bar(
                 cat_summary,
-                x='品类',
-                y='商品数量',
+                x='category',
+                y='product_count',
                 title='各品类商品数量',
-                color='品类',
-                text_auto='.0f'
+                color='category',
+                text_auto='.0f',
+                labels={'category': '品类', 'product_count': '商品数量'}
             )
             fig_count.update_layout(height=400, showlegend=False)
             st.plotly_chart(fig_count, use_container_width=True)
 
+        st.markdown("### � 历史日均 vs 预测日均对比")
+
+        compare_df = cat_summary.copy()
+        compare_df = compare_df.rename(columns={
+            'category': '品类',
+            'historical_daily_avg': '历史日均销量',
+            'forecast_daily_avg': '预测日均销量'
+        })
+
+        compare_melted = compare_df.melt(
+            id_vars=['品类'],
+            value_vars=['历史日均销量', '预测日均销量'],
+            var_name='类型',
+            value_name='日均销量'
+        )
+
+        fig_compare = px.bar(
+            compare_melted,
+            x='品类',
+            y='日均销量',
+            color='类型',
+            barmode='group',
+            title='各品类历史日均销量 vs 预测日均销量对比',
+            text_auto='.1f'
+        )
+        fig_compare.update_layout(
+            height=500,
+            xaxis_title='品类',
+            yaxis_title='日均销量',
+            legend_title='数据类型'
+        )
+        st.plotly_chart(fig_compare, use_container_width=True)
+
         st.markdown("### 📋 品类明细")
-        cat_summary['预测总销量'] = cat_summary['预测总销量'].round(2)
+        display_cols = ['category', 'product_count', 'historical_daily_avg', 'forecast_daily_avg', 'total_forecast', 'low_confidence_days']
+        display_cat = cat_summary[display_cols].copy()
+        display_cat.columns = ['品类', '商品数量', '历史日均销量', '预测日均销量', '预测总销量', '低可信天数']
+        display_cat['历史日均销量'] = display_cat['历史日均销量'].round(2)
+        display_cat['预测日均销量'] = display_cat['预测日均销量'].round(2)
+        display_cat['预测总销量'] = display_cat['预测总销量'].round(2)
+
+        display_cat['预测涨幅'] = np.where(
+            display_cat['历史日均销量'] > 0,
+            ((display_cat['预测日均销量'] - display_cat['历史日均销量']) / display_cat['历史日均销量'] * 100).round(1).astype(str) + '%',
+            'N/A'
+        )
+
         st.dataframe(
-            cat_summary,
+            display_cat,
             use_container_width=True,
             hide_index=True
         )
